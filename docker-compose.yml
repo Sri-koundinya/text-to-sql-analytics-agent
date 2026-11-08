@@ -1,0 +1,71 @@
+# Local stack: PostgreSQL 16 + FastAPI backend + Streamlit frontend.
+#   cp .env.example .env   # then set POSTGRES_PASSWORD and OPENAI_API_KEY
+#   docker compose up --build
+# Re-seed from scratch: docker compose down -v && docker compose up --build
+
+name: text-to-sql
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: retail_analytics
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env (copy .env.example)}
+    volumes:
+      # Scripts run once, in name order, on an empty data volume.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./db/seed_large.sql:/docker-entrypoint-initdb.d/02_seed_large.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
+    healthcheck:
+      # TCP check: the init-time server listens on the unix socket only,
+      # so this stays unhealthy until schema + seed have finished.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d retail_analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Always the read-only role, never the admin user (see db/init.sql).
+      DATABASE_URL: postgresql+psycopg://analytics_reader:analytics_reader@db:5432/retail_analytics
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.2}
+      MAX_RESULT_ROWS: ${MAX_RESULT_ROWS:-200}
+      QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-8000}
+      MAX_SQL_RETRIES: ${MAX_SQL_RETRIES:-2}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-20}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DEBUG: ${DEBUG:-false}
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: http://backend:8000
+    ports:
+      - "127.0.0.1:8501:8501"
+
+volumes:
+  pgdata:
